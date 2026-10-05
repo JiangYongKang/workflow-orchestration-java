@@ -1,11 +1,12 @@
 package com.github.highcumontoa.workfloworchestrationjava.web;
 
 import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowDefinition;
+import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowHistory;
 import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowSnapshot;
 import com.github.highcumontoa.workfloworchestrationjava.service.WorkflowService;
 import org.springframework.web.bind.annotation.*;
 
-/** REST：提交 / 查询 / 恢复。 */
+/** REST：提交 / 查询 / 恢复 / 取消 / 历史。 */
 @RestController
 @RequestMapping("/api/workflows")
 public class WorkflowController {
@@ -29,5 +30,15 @@ public class WorkflowController {
     @PostMapping("/{workflowId}/resume")
     public WorkflowSnapshot resume(@PathVariable String workflowId) {
         return workflowService.resume(workflowId);
+    }
+
+    @PostMapping("/{workflowId}/cancel")
+    public WorkflowSnapshot cancel(@PathVariable String workflowId) {
+        return workflowService.cancel(workflowId);
+    }
+
+    @GetMapping("/{workflowId}/history")
+    public WorkflowHistory history(@PathVariable String workflowId) {
+        return workflowService.history(workflowId);
     }
 }

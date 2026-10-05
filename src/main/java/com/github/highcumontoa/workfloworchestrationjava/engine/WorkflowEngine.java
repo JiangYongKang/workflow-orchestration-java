@@ -2,9 +2,12 @@ package com.github.highcumontoa.workfloworchestrationjava.engine;
 
 import com.github.highcumontoa.workfloworchestrationjava.config.WorkflowProperties;
 import com.github.highcumontoa.workfloworchestrationjava.model.TaskDefinition;
+import com.github.highcumontoa.workfloworchestrationjava.model.TaskRunRecord;
 import com.github.highcumontoa.workfloworchestrationjava.model.TaskSnapshot;
 import com.github.highcumontoa.workfloworchestrationjava.model.TaskState;
 import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowDefinition;
+import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowHistory;
+import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowRunRecord;
 import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowSnapshot;
 import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowState;
 import com.github.highcumontoa.workfloworchestrationjava.validation.WorkflowValidator;
@@ -66,7 +69,8 @@ public class WorkflowEngine {
     /** 登记新工作流：先校验，再占用 id；重复 id 抛 {@link IllegalArgumentException}。 */
     public WorkflowExecution register(WorkflowDefinition definition) {
         validator.validate(definition);
-        WorkflowExecution execution = new WorkflowExecution(definition);
+        WorkflowExecution execution = new WorkflowExecution(
+                definition, DefinitionFingerprint.of(definition, properties));
         if (executions.putIfAbsent(definition.getWorkflowId(), execution) != null) {
             log.warn("[{}] 登记被拒绝: 工作流 id 已存在（提交幂等应由服务层保证）",
                     definition.getWorkflowId());
@@ -82,6 +86,16 @@ public class WorkflowEngine {
     /** 按 id 获取执行记录，不存在返回 null。 */
     public WorkflowExecution get(String workflowId) {
         return executions.get(workflowId);
+    }
+
+    /** 对定义做登记前校验（服务层在幂等/冲突判定前也需要先挡掉非法定义）。 */
+    public void validate(WorkflowDefinition definition) {
+        validator.validate(definition);
+    }
+
+    /** 计算定义的规范化指纹（与登记时同一套规则）。 */
+    public String fingerprintOf(WorkflowDefinition definition) {
+        return DefinitionFingerprint.of(definition, properties);
     }
 
     /**
@@ -124,7 +138,59 @@ public class WorkflowEngine {
         execution.setFailureTask(null);
         execution.setFailureReason("");
 
+        // 本轮基线：恢复轮中已完成任务保持原值，用于区分“本轮执行”与“上轮保留”
+        long runStart = System.currentTimeMillis();
+        Map<String, TaskBaseline> baseline = new LinkedHashMap<>();
+        for (TaskRuntime t : tasks.values()) {
+            baseline.put(t.getDefinition().getName(), new TaskBaseline(
+                    t.getState(), t.getAttempts(), t.getStartMillis(), t.getFinishMillis()));
+        }
+
         runLoop(execution, tasks, maxConcurrency, maxAttempts, timeoutMillis);
+        recordRun(execution, tasks, run, runStart, baseline);
+    }
+
+    /** 任务在某轮开始前的基线快照（仅引擎内部使用）。 */
+    private record TaskBaseline(TaskState state, int attempts,
+                                long startMillis, long finishMillis) {
+    }
+
+    /**
+     * 本轮结束后追加一条不可变历史记录：只追加、不覆盖，轮次顺序即记录顺序。
+     * 本轮未触碰的任务（恢复时保留的 SUCCEEDED）记 attempts=0、耗时=0，
+     * 避免跨轮重复计数。
+     */
+    private void recordRun(WorkflowExecution execution, Map<String, TaskRuntime> tasks,
+                           int run, long runStart, Map<String, TaskBaseline> baseline) {
+        String workflowId = execution.getDefinition().getWorkflowId();
+        List<TaskRunRecord> taskRecords = new ArrayList<>();
+        for (TaskRuntime t : tasks.values()) {
+            TaskBaseline base = baseline.get(t.getDefinition().getName());
+            boolean untouched = t.getState() == base.state()
+                    && t.getAttempts() == base.attempts()
+                    && t.getStartMillis() == base.startMillis()
+                    && t.getFinishMillis() == base.finishMillis();
+            if (untouched) {
+                taskRecords.add(new TaskRunRecord(t.getDefinition().getName(), t.getState(),
+                        0, 0, 0, 0, "carried over from previous run"));
+            } else {
+                long duration = t.getFinishMillis() == 0
+                        ? 0 : Math.max(0, t.getFinishMillis() - t.getStartMillis());
+                taskRecords.add(new TaskRunRecord(t.getDefinition().getName(), t.getState(),
+                        t.getAttempts() - base.attempts(),
+                        t.getStartMillis(), t.getFinishMillis(), duration,
+                        t.getLastMessage()));
+            }
+        }
+        WorkflowRunRecord record = new WorkflowRunRecord(run, runStart,
+                execution.getFinishedAt(), execution.getState(),
+                execution.getFailureTask(), execution.getFailureReason(),
+                List.copyOf(taskRecords));
+        execution.appendRunRecord(record);
+        log.info("[{}] 历史追加：第{}轮结论={}，起止={}~{}，本轮执行任务数={}",
+                workflowId, run, record.conclusion(), runStart, execution.getFinishedAt(),
+                taskRecords.stream().filter(r -> !"carried over from previous run"
+                        .equals(r.message())).count());
     }
 
     /**
@@ -192,27 +258,37 @@ public class WorkflowEngine {
         while (!done) {
             synchronized (scheduleLock) {
                 while (!done) {
-                    // 1) 失败已注定：所有尚未派发的任务直接 SKIPPED
+                    // 1) 失败已注定或已请求取消：所有尚未派发的任务直接收敛，不再开始
                     boolean madeProgress = false;
-                    if (firstFailure[0] != null) {
+                    boolean cancelRequested = execution.isCancelRequested();
+                    if (firstFailure[0] != null || cancelRequested) {
                         for (TaskRuntime t : tasks.values()) {
                             if (t.getState() == TaskState.PENDING) {
-                                t.setState(TaskState.SKIPPED);
-                                t.setLastMessage("skipped: task '"
-                                        + firstFailure[0].getDefinition().getName()
-                                        + "' failed");
-                                log.info("[{}] 任务 {} 状态流转 PENDING -> SKIPPED，依据=上游任务 {} 已失败",
-                                        workflowId, t.getDefinition().getName(),
-                                        firstFailure[0].getDefinition().getName());
+                                if (cancelRequested) {
+                                    t.setState(TaskState.CANCELLED);
+                                    t.setLastMessage("cancelled: cancel requested");
+                                    log.info("[{}] 任务 {} 状态流转 PENDING -> CANCELLED，"
+                                                    + "依据=收到取消请求，未启动任务不再开始",
+                                            workflowId, t.getDefinition().getName());
+                                } else {
+                                    t.setState(TaskState.SKIPPED);
+                                    t.setLastMessage("skipped: task '"
+                                            + firstFailure[0].getDefinition().getName()
+                                            + "' failed");
+                                    log.info("[{}] 任务 {} 状态流转 PENDING -> SKIPPED，依据=上游任务 {} 已失败",
+                                            workflowId, t.getDefinition().getName(),
+                                            firstFailure[0].getDefinition().getName());
+                                }
                                 madeProgress = true;
                             }
                         }
                     }
 
-                    // 2) 派发所有“依赖已满足且当前有并发许可”的任务
+                    // 2) 派发所有“依赖已满足且当前有并发许可”的任务（取消后不再派发）
                     for (TaskRuntime t : tasks.values()) {
                         if (t.getState() == TaskState.PENDING
                                 && firstFailure[0] == null
+                                && !execution.isCancelRequested()
                                 && depsSatisfied(t, tasks)
                                 && permits.tryAcquire()) {
                             // 许可已到手，任务才允许离开 PENDING，杜绝假死
@@ -248,10 +324,23 @@ public class WorkflowEngine {
             }
         }
 
-        // 终态判定：依据首个失败任务，结论确定
+        // 终态判定：取消优先于失败（取消是显式外部决定），结论确定
         execution.setPeakConcurrency(peak.get());
         execution.setFinishedAt(System.currentTimeMillis());
-        if (firstFailure[0] != null || interrupted) {
+        if (execution.isCancelRequested()) {
+            for (TaskRuntime t : tasks.values()) {
+                if (t.getState() == TaskState.PENDING || t.getState() == TaskState.RUNNING) {
+                    t.setState(TaskState.CANCELLED);
+                    t.setLastMessage("cancelled: workflow cancelled");
+                }
+            }
+            execution.setFailureTask(null);
+            execution.setFailureReason("");
+            execution.setState(WorkflowState.CANCELLED);
+            log.info("[{}] 工作流状态流转 RUNNING -> CANCELLED，依据=收到取消请求："
+                            + "在途任务已收敛、未启动任务不再开始、已完成任务结果保留，峰值并发={}",
+                    workflowId, peak.get());
+        } else if (firstFailure[0] != null || interrupted) {
             for (TaskRuntime t : tasks.values()) {
                 if (t.getState() == TaskState.PENDING || t.getState() == TaskState.RUNNING) {
                     t.setState(TaskState.SKIPPED);
@@ -296,8 +385,10 @@ public class WorkflowEngine {
                         workflowId, task.getDefinition().getName(),
                         permitsTrack(permits, maxConcurrency));
 
-                boolean ok = taskExecutor.runTask(task, workflowId, maxAttempts, timeoutMillis);
-                if (!ok) {
+                boolean ok = taskExecutor.runTask(task, workflowId, maxAttempts, timeoutMillis,
+                        execution::isCancelRequested);
+                if (!ok && task.getState() == TaskState.FAILED) {
+                    // 取消导致的收敛不算失败；只有稳定失败才决定工作流 FAILED
                     synchronized (scheduleLock) {
                         if (firstFailure[0] == null) {
                             firstFailure[0] = task;
@@ -379,6 +470,13 @@ public class WorkflowEngine {
     public Optional<WorkflowSnapshot> snapshot(String workflowId) {
         WorkflowExecution execution = executions.get(workflowId);
         return execution == null ? Optional.empty() : Optional.of(toSnapshot(execution, false));
+    }
+
+    /** 查询追加式执行历史；不存在返回 empty。历史记录不可变、按轮次顺序稳定。 */
+    public Optional<WorkflowHistory> history(String workflowId) {
+        WorkflowExecution execution = executions.get(workflowId);
+        return execution == null ? Optional.empty()
+                : Optional.of(new WorkflowHistory(workflowId, execution.runRecords()));
     }
 
     public Optional<WorkflowSnapshot> snapshot(WorkflowExecution execution, boolean duplicate) {

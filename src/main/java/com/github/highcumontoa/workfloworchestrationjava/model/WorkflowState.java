@@ -5,5 +5,6 @@ public enum WorkflowState {
     REGISTERED,
     RUNNING,
     SUCCEEDED,
-    FAILED
+    FAILED,
+    CANCELLED
 }

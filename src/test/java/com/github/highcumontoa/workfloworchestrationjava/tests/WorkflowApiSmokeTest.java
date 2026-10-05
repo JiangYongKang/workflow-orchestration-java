@@ -102,8 +102,7 @@ class WorkflowApiSmokeTest {
 
     @Test
     @DisplayName("HTTP 失败恢复：首轮 FAILED，resume 后 SUCCEEDED；再次 resume 幂等")
-    void failureAndResumeOverHttp() throws Exception {
-        Map<String, Object> wf = workflow("http-resume",
+    void failureAndResumeOverHttp() throws Exception {        Map<String, Object> wf = workflow("http-resume",
                 List.of(
                         task("A", "ALWAYS_SUCCEED", null, null),
                         task("B", "FAIL_TOTAL_N", List.of("2", "0"), null),
@@ -141,5 +140,75 @@ class WorkflowApiSmokeTest {
         assertEquals("SUCCEEDED", a.get("state").asText());
         assertEquals(2, a.get("runCount").asInt());
         log.info("[HTTP 测试] 成功后再次 resume 幂等，runCount 仍=2");
+    }
+
+    @Test
+    @DisplayName("HTTP 新增语义：非法参数 400 且不留记录、冲突提交 409、取消后恢复无效、历史可翻账")
+    void cancelHistoryAndConflictOverHttp() throws Exception {
+        // 1) 非法执行参数 -> 400，且不留任何记录（随后 GET 仍 404）
+        Map<String, Object> badParam = workflow("http-bad-param",
+                List.of(task("A", "ALWAYS_SUCCEED", null, null)), 0, 1, 5000L);
+        ResponseEntity<String> bad = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(badParam), String.class);
+        log.info("[HTTP 测试] 非法 maxConcurrency=0 status={} body={}",
+                bad.getStatusCode(), bad.getBody());
+        assertEquals(HttpStatus.BAD_REQUEST, bad.getStatusCode());
+        assertEquals(HttpStatus.NOT_FOUND,
+                rest.getForEntity("/api/workflows/http-bad-param", String.class).getStatusCode());
+
+        // 2) 修正后同 id 可正常提交（无半成品状态）
+        Map<String, Object> fixed = workflow("http-bad-param",
+                List.of(task("A", "ALWAYS_SUCCEED", null, null)), 1, 1, 5000L);
+        ResponseEntity<String> ok = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(fixed), String.class);
+        assertEquals(HttpStatus.OK, ok.getStatusCode());
+        assertEquals("SUCCEEDED", json.readTree(ok.getBody()).get("state").asText());
+
+        // 3) 同 id 不同声明 -> 409 WORKFLOW_CONFLICT
+        Map<String, Object> changed = workflow("http-bad-param",
+                List.of(task("A", "ALWAYS_FAIL", null, null)), 1, 1, 5000L);
+        ResponseEntity<String> conflict = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(changed), String.class);
+        JsonNode c = json.readTree(conflict.getBody());
+        log.info("[HTTP 测试] 冲突提交 status={} body={}", conflict.getStatusCode(),
+                conflict.getBody());
+        assertEquals(HttpStatus.CONFLICT, conflict.getStatusCode());
+        assertEquals("WORKFLOW_CONFLICT", c.get("error").asText());
+
+        // 4) 失败 -> 取消 -> CANCELLED 终态；恢复请求不再生效
+        Map<String, Object> failing = workflow("http-cancel",
+                List.of(task("A", "ALWAYS_FAIL", null, null)), 1, 1, 5000L);
+        ResponseEntity<String> submitted = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(failing), String.class);
+        assertEquals("FAILED", json.readTree(submitted.getBody()).get("state").asText());
+
+        ResponseEntity<String> cancelled = rest.exchange(
+                "/api/workflows/http-cancel/cancel", HttpMethod.POST, HttpEntity.EMPTY,
+                String.class);
+        JsonNode cc = json.readTree(cancelled.getBody());
+        log.info("[HTTP 测试] 取消后 state={} runCount={}",
+                cc.get("state").asText(), cc.get("runCount").asInt());
+        assertEquals("CANCELLED", cc.get("state").asText());
+
+        ResponseEntity<String> resumed = rest.exchange(
+                "/api/workflows/http-cancel/resume", HttpMethod.POST, HttpEntity.EMPTY,
+                String.class);
+        JsonNode rr = json.readTree(resumed.getBody());
+        log.info("[HTTP 测试] 取消后恢复 state={} runCount={}（不得重新执行）",
+                rr.get("state").asText(), rr.get("runCount").asInt());
+        assertEquals("CANCELLED", rr.get("state").asText());
+        assertEquals(1, rr.get("runCount").asInt());
+
+        // 5) 历史可翻账：1 轮、结论 FAILED、任务 A 尝试 1 次；反复查询一致
+        ResponseEntity<String> history = rest.getForEntity(
+                "/api/workflows/http-cancel/history", String.class);
+        JsonNode h = json.readTree(history.getBody());
+        log.info("[HTTP 测试] 历史={}", history.getBody());
+        assertEquals(1, h.get("runs").size());
+        assertEquals("FAILED", h.get("runs").get(0).get("conclusion").asText());
+        assertEquals(1, h.get("runs").get(0).get("tasks").get(0).get("attempts").asInt());
+        assertEquals(history.getBody(),
+                rest.getForEntity("/api/workflows/http-cancel/history", String.class).getBody(),
+                "反复查询历史必须一致");
     }
 }

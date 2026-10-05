@@ -37,6 +37,23 @@ public class WorkflowValidator {
                     + definition.getWorkflowId());
         }
 
+        // 0) 执行参数取值校验：必须在登记之前挡掉，杜绝“拒绝执行但记录已存在”的半成品状态
+        if (definition.getMaxConcurrency() != null && definition.getMaxConcurrency() < 1) {
+            log.warn("[{}] 登记被拒绝: maxConcurrency={} 非法（必须 >= 1），未留下任何记录",
+                    definition.getWorkflowId(), definition.getMaxConcurrency());
+            throw new IllegalArgumentException("maxConcurrency must be >= 1");
+        }
+        if (definition.getMaxAttempts() != null && definition.getMaxAttempts() < 1) {
+            log.warn("[{}] 登记被拒绝: maxAttempts={} 非法（必须 >= 1），未留下任何记录",
+                    definition.getWorkflowId(), definition.getMaxAttempts());
+            throw new IllegalArgumentException("maxAttempts must be >= 1");
+        }
+        if (definition.getTaskTimeoutMillis() != null && definition.getTaskTimeoutMillis() < 1) {
+            log.warn("[{}] 登记被拒绝: taskTimeoutMillis={} 非法（必须 >= 1），未留下任何记录",
+                    definition.getWorkflowId(), definition.getTaskTimeoutMillis());
+            throw new IllegalArgumentException("taskTimeoutMillis must be >= 1");
+        }
+
         // 1) 同名任务重复声明
         Set<String> seen = new HashSet<>();
         for (TaskDefinition task : tasks) {

@@ -14,6 +14,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
 
 /**
  * 单任务执行器。
@@ -50,10 +51,14 @@ public class TaskExecutor {
     /**
      * 在已持有工作流并发许可的前提下执行一个任务（含全部重试）。
      *
+     * <p>取消语义：{@code cancelRequested} 为真时，不再发起新的尝试，
+     * 退避等待也会提前结束；已开始的单次尝试仍由看门狗施加超时硬上限，
+     * 在其结束后安全收敛为 {@link TaskState#CANCELLED}，绝不无限执行。
+     *
      * @return 任务最终是否成功
      */
-    boolean runTask(TaskRuntime task, String workflowId, int maxAttempts, long timeoutMillis)
-            throws InterruptedException {
+    boolean runTask(TaskRuntime task, String workflowId, int maxAttempts, long timeoutMillis,
+                    BooleanSupplier cancelRequested) throws InterruptedException {
         String name = task.getDefinition().getName();
         task.setStartMillis(System.currentTimeMillis());
         // RUNNING 状态由调度器在持锁、拿到并发许可时设置，这里不重复流转
@@ -61,6 +66,15 @@ public class TaskExecutor {
 
         try {
             while (true) {
+                if (cancelRequested.getAsBoolean()) {
+                    task.setFinishMillis(System.currentTimeMillis());
+                    task.setState(TaskState.CANCELLED);
+                    task.setLastMessage("cancelled: cancel requested before next attempt");
+                    log.info("[{}] 任务 {} 状态流转 RUNNING -> CANCELLED，依据=收到取消请求，"
+                                    + "不再发起新尝试（已尝试{}次）",
+                            workflowId, name, task.getAttempts());
+                    return false;
+                }
                 int attempt = task.incrementAttempts();
                 TaskContext ctx = new TaskContext(workflowId, name, attempt,
                         task.getDefinition().getBehavior(),
@@ -91,7 +105,7 @@ public class TaskExecutor {
                 log.info("[{}] 任务 {} 第{}次尝试失败（{}），未达上限{}，退避{}ms 后重试",
                         workflowId, name, attempt, attemptMessage, maxAttempts,
                         properties.getRetryBackoffMillis());
-                Thread.sleep(properties.getRetryBackoffMillis());
+                sleepCancellable(properties.getRetryBackoffMillis(), cancelRequested);
             }
         } finally {
             if (task.getState() == TaskState.RUNNING) {
@@ -102,6 +116,19 @@ public class TaskExecutor {
                 log.warn("[{}] 任务 {} 状态流转 RUNNING -> FAILED，依据=执行被中断",
                         workflowId, name);
             }
+        }
+    }
+
+    /** 可被取消请求提前结束的退避等待：分片睡眠，每片检查一次取消标记。 */
+    private void sleepCancellable(long millis, BooleanSupplier cancelRequested)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + millis;
+        while (true) {
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0 || cancelRequested.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(Math.min(left, 20));
         }
     }
 
