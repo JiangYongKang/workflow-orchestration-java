@@ -6,5 +6,7 @@ public enum TaskState {
     RUNNING,
     SUCCEEDED,
     FAILED,
-    SKIPPED
+    SKIPPED,
+    /** 因工作流被取消而未启动（终态，区别于失败连累的 SKIPPED）。 */
+    CANCELLED
 }

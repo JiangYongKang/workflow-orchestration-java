@@ -50,9 +50,11 @@ public class TaskExecutor {
     /**
      * 在已持有工作流并发许可的前提下执行一个任务（含全部重试）。
      *
+     * @param cancelRequested 工作流取消标志；两次尝试之间观测到即停止重试、安全收敛
      * @return 任务最终是否成功
      */
-    boolean runTask(TaskRuntime task, String workflowId, int maxAttempts, long timeoutMillis)
+    boolean runTask(TaskRuntime task, String workflowId, int maxAttempts, long timeoutMillis,
+                    java.util.function.BooleanSupplier cancelRequested)
             throws InterruptedException {
         String name = task.getDefinition().getName();
         task.setStartMillis(System.currentTimeMillis());
@@ -88,10 +90,21 @@ public class TaskExecutor {
                             workflowId, name, maxAttempts, attemptMessage);
                     return false;
                 }
+                if (cancelRequested.getAsBoolean()) {
+                    // 取消期间安全收敛：当前尝试已结束，不再发起新的尝试
+                    task.setFinishMillis(System.currentTimeMillis());
+                    task.setState(TaskState.CANCELLED);
+                    task.setLastMessage("cancelled after attempt " + attempt
+                            + ": " + attemptMessage);
+                    log.warn("[{}] 任务 {} 状态流转 RUNNING -> CANCELLED，依据=收到取消请求，"
+                                    + "第{}次尝试已收敛，不再重试（已尝试{}次的结果保留）",
+                            workflowId, name, attempt, attempt);
+                    return false;
+                }
                 log.info("[{}] 任务 {} 第{}次尝试失败（{}），未达上限{}，退避{}ms 后重试",
                         workflowId, name, attempt, attemptMessage, maxAttempts,
                         properties.getRetryBackoffMillis());
-                Thread.sleep(properties.getRetryBackoffMillis());
+                sleepCancellable(properties.getRetryBackoffMillis(), cancelRequested);
             }
         } finally {
             if (task.getState() == TaskState.RUNNING) {
@@ -102,6 +115,18 @@ public class TaskExecutor {
                 log.warn("[{}] 任务 {} 状态流转 RUNNING -> FAILED，依据=执行被中断",
                         workflowId, name);
             }
+        }
+    }
+
+    /** 可被取消提前打断的退避：分片睡眠并观测取消标志，保证取消后及时收敛。 */
+    private void sleepCancellable(long backoffMillis,
+                                  java.util.function.BooleanSupplier cancelRequested)
+            throws InterruptedException {
+        long remaining = backoffMillis;
+        while (remaining > 0 && !cancelRequested.getAsBoolean()) {
+            long slice = Math.min(remaining, 50);
+            Thread.sleep(slice);
+            remaining -= slice;
         }
     }
 

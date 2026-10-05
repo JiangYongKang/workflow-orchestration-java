@@ -36,7 +36,17 @@ public class WorkflowService {
         this.engine = engine;
     }
 
-    /** 提交并同步执行；重复/并发提交只产生一份执行记录。 */
+    /**
+     * 提交并同步执行。
+     *
+     * <p>语义：
+     * <ul>
+     *   <li>非法声明（含非法并发/重试/超时取值）在登记前被拦截，不留下任何记录；</li>
+     *   <li>同 id 且声明指纹一致：幂等返回既有结论，不产生第二次执行；</li>
+     *   <li>同 id 但声明指纹不一致：抛 {@link WorkflowConflictException}（HTTP 409），
+     *       绝不把对不上的旧结论当成新提交的结果返回。</li>
+     * </ul>
+     */
     public WorkflowSnapshot submit(WorkflowDefinition definition) {
         if (definition == null || definition.getWorkflowId() == null
                 || definition.getWorkflowId().isBlank()) {
@@ -45,13 +55,19 @@ public class WorkflowService {
         String workflowId = definition.getWorkflowId();
         Object lock = idLocks.computeIfAbsent(workflowId, k -> new Object());
         synchronized (lock) {
+            // 先校验（不登记）：非法声明无论是否重复提交都直接拒绝，不留半成品记录
+            engine.validate(definition);
             WorkflowExecution existing = engine.get(workflowId);
             if (existing != null) {
-                log.info("[{}] 重复提交被幂等拦截：返回既有执行记录，不产生第二次执行（状态={}）",
-                        workflowId, existing.getState());
+                if (!existing.getDefinition().fingerprint().equals(definition.fingerprint())) {
+                    log.warn("[{}] 提交冲突：同 id 但任务声明与既有记录不一致，"
+                            + "拒绝并显式报冲突（不返回旧结论）", workflowId);
+                    throw new WorkflowConflictException(workflowId);
+                }
+                log.info("[{}] 重复提交被幂等拦截：声明指纹一致，返回既有执行记录，"
+                        + "不产生第二次执行（状态={}）", workflowId, existing.getState());
                 return engine.snapshot(existing, true).orElseThrow();
             }
-            // register 内先做校验：非法定义抛 ValidationException，不留下任何记录
             WorkflowExecution execution = engine.register(definition);
             engine.execute(execution);
             return engine.snapshot(execution, false).orElseThrow();
@@ -72,8 +88,26 @@ public class WorkflowService {
     }
 
     /**
+     * 取消工作流（幂等）：正在执行的安全收敛、未启动的不再启动、已完成的保留；
+     * CANCELLED 是稳定终态，之后的恢复请求不会把它重新拉起。
+     * 重复取消、对已成功工作流的取消均为幂等空操作，返回当前快照。
+     */
+    public WorkflowSnapshot cancel(String workflowId) {
+        WorkflowExecution execution = engine.get(workflowId);
+        if (execution == null) {
+            log.info("[{}] 取消失败：工作流未登记", workflowId);
+            throw new WorkflowNotFoundException(workflowId);
+        }
+        engine.cancelAndAwait(execution);
+        WorkflowSnapshot s = engine.snapshot(execution, false).orElseThrow();
+        log.info("[{}] 取消请求处理完毕：状态={}，runCount={}", workflowId, s.state(), s.runCount());
+        return s;
+    }
+
+    /**
      * 失败恢复：仅 FAILED 工作流会再执行一轮，从已完成任务继续；
-     * 非 FAILED（含执行中、成功）状态下幂等返回当前快照。
+     * 非 FAILED（含执行中、成功、已取消）状态下幂等返回当前快照。
+     * CANCELLED 为稳定终态，恢复请求不会把它重新拉起。
      */
     public WorkflowSnapshot resume(String workflowId) {
         WorkflowExecution execution = engine.get(workflowId);

@@ -16,6 +16,7 @@ public record WorkflowSnapshot(
         long startedAt,
         long finishedAt,
         List<TaskSnapshot> tasks,
-        boolean duplicateSubmission
+        boolean duplicateSubmission,
+        List<RunRecord> history
 ) {
 }

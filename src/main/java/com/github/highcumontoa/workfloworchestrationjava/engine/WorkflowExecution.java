@@ -1,8 +1,12 @@
 package com.github.highcumontoa.workfloworchestrationjava.engine;
 
+import com.github.highcumontoa.workfloworchestrationjava.model.RunRecord;
 import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowDefinition;
 import com.github.highcumontoa.workfloworchestrationjava.model.WorkflowState;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -18,6 +22,10 @@ public final class WorkflowExecution {
     private volatile int peakConcurrency;
     /** 首次执行前为 null；执行后保留全部任务运行态，供查询与恢复使用。 */
     private Map<String, TaskRuntime> taskRuntimes;
+    /** 取消请求标志：由取消接口置位，调度循环与任务执行器共同观测。 */
+    private volatile boolean cancelRequested;
+    /** 只增不改的执行轮历史；每轮结束时由引擎追加一条不可变记录。 */
+    private final List<RunRecord> history = new ArrayList<>();
 
     WorkflowExecution(WorkflowDefinition definition) {
         this.definition = definition;
@@ -57,5 +65,18 @@ public final class WorkflowExecution {
 
     synchronized Map<String, TaskRuntime> currentTaskRuntimes() {
         return taskRuntimes;
+    }
+
+    public boolean isCancelRequested() { return cancelRequested; }
+    public void requestCancel() { this.cancelRequested = true; }
+
+    /** 追加一轮历史（引擎在每轮收敛后调用，调用方持有 id 锁，保证不并发）。 */
+    synchronized void appendHistory(RunRecord record) {
+        history.add(record);
+    }
+
+    /** 返回历史的不可变副本，顺序即轮次顺序，反复读取结论一致。 */
+    public synchronized List<RunRecord> history() {
+        return Collections.unmodifiableList(new ArrayList<>(history));
     }
 }

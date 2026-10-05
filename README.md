@@ -6,7 +6,9 @@
 - 依赖登记与校验（同名任务 / 未知依赖 / 循环依赖，拒绝原因可区分）
 - 受控并发（信号量硬上限）+ 有界重试（次数上限 + 单任务耗时上限）
 - 失败恢复（从已完成部分继续，已完成任务不重复执行/计数）
-- 提交幂等（顺序与并发重复提交只产生一份执行记录）
+- 中途取消（在途任务安全收敛、未启动不再开始、已完成结果保留；幂等且为稳定终态）
+- 执行历史留痕（逐轮起止/结论 + 每任务尝试次数/耗时/结果，只增不改）
+- 提交幂等 + 冲突检测（同 id 同声明幂等；同 id 不同声明显式 409；非法取值登记前拦截）
 - 全程日志打印“触发原因 + 状态流转依据”，快照查询结论稳定
 
 ---
@@ -17,25 +19,32 @@
 
 ```
 REGISTERED ──首次执行──▶ RUNNING ──全部任务成功──────────▶ SUCCEEDED（终态）
-                           │
-                           └──任一任务重试耗尽/超时收敛──▶ FAILED ──resume──▶ RUNNING …
+   │                     │
+   │                     ├──任一任务重试耗尽/超时收敛──▶ FAILED ──resume──▶ RUNNING …
+   │                     │                              │
+   └──cancel─────────────┴──────────cancel──────────────┴──▶ CANCELLED（终态，不可逆）
 ```
 
 | 状态 | 含义 | 允许的流转 |
 |---|---|---|
-| `REGISTERED` | 已登记并通过校验，尚未执行 | → `RUNNING` |
-| `RUNNING` | 正在调度执行（查询时可见中间任务状态） | → `SUCCEEDED` / `FAILED` |
-| `SUCCEEDED` | 全部任务成功的**稳定终态**，不允许再执行 | 终态；再次 `resume` 幂等返回 |
-| `FAILED` | 出现稳定失败任务的**稳定终态**（不报告成功） | `resume` → `RUNNING` |
+| `REGISTERED` | 已登记并通过校验，尚未执行 | → `RUNNING`；`cancel` → `CANCELLED` |
+| `RUNNING` | 正在调度执行（查询时可见中间任务状态） | → `SUCCEEDED` / `FAILED` / `CANCELLED` |
+| `SUCCEEDED` | 全部任务成功的**稳定终态**，不允许再执行 | 终态；`resume`/`cancel` 均幂等返回、不改变结论 |
+| `FAILED` | 出现稳定失败任务的**稳定终态**（不报告成功） | `resume` → `RUNNING`；`cancel` → `CANCELLED` |
+| `CANCELLED` | 被取消的**稳定终态**：恢复请求不会把它重新拉起 | 终态；任何 `resume`/`cancel` 幂等返回 |
 
 ### 1.2 任务状态 `TaskState`
 
 ```
 PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成功────────────▶ SUCCEEDED（终态）
    │                                  │
-   │                                  └──重试次数达上限仍失败─────▶ FAILED（终态，触发工作流失败）
+   │                                  ├──重试次数达上限仍失败─────▶ FAILED（终态，触发工作流失败）
+   │                                  │
+   │                                  └──取消时已跑尝试收敛──────▶ CANCELLED（终态，保留尝试计数）
    │
-   └──工作流已注定失败、任务未及派发──▶ SKIPPED（终态，可在恢复时回到 PENDING）
+   ├──工作流已注定失败、任务未及派发──▶ SKIPPED（终态，可在恢复时回到 PENDING）
+   │
+   └──工作流被取消、任务未及派发────▶ CANCELLED（终态，不进入恢复重置）
 ```
 
 - 任务仅在其**全部依赖均为 `SUCCEEDED`** 时才可能被派发，因此实际执行顺序必然满足依赖关系。
@@ -85,7 +94,68 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
 
 ---
 
-## 3. 受控任务行为（确定性模拟）
+## 3. 取消语义（`POST /api/workflows/{id}/cancel`）
+
+- **随时可发起**：取消不占用提交/恢复的 id 锁，执行中即可送达。
+- **安全收敛**：收到取消后，调度器立即停止派发新任务；在途任务当前这次尝试
+  允许跑完（仍受单任务超时硬上限约束），之后不再重试，落到 `CANCELLED`。
+- **结果保留**：已 `SUCCEEDED` 的任务结果与尝试计数原样保留；未启动的任务
+  置为 `CANCELLED`（区别于失败连累的 `SKIPPED`），尝试计数为 0。
+- **约束不变**：取消过程中并发上限、单任务耗时上界、尝试次数上界全部继续成立；
+  取消等待本身也有界（由 `maxAttempts × (taskTimeoutMillis + backoff)` 推导上界）。
+- **幂等**：重复取消、对 `SUCCEEDED` 工作流的取消都是幂等空操作，返回当前快照。
+- **稳定终态**：`CANCELLED` 不可逆——之后的 `resume` 被幂等忽略，不会重新拉起；
+  对 `FAILED` 工作流取消会直接流转 `FAILED -> CANCELLED`，封死后续恢复。
+
+---
+
+## 4. 执行历史留痕
+
+快照中的 `history` 字段是按轮次只增不改的留痕数组，每轮一条：
+
+```json
+{
+  "runNumber": 2,
+  "startedAtEpochMillis": 1791158974389,
+  "finishedAtEpochMillis": 1791158974391,
+  "outcome": "SUCCEEDED",
+  "failureTask": null,
+  "failureReason": "",
+  "tasks": [
+    {"name": "A", "finalState": "SUCCEEDED", "attempts": 1,
+     "startedAtEpochMillis": 1791158974389, "finishedAtEpochMillis": 1791158974390,
+     "durationMillis": 1, "message": "succeeded on attempt 1"}
+  ]
+}
+```
+
+- 每轮记录：轮次号、起止时间、最终结论（`SUCCEEDED`/`FAILED`/`CANCELLED`）、
+  失败任务与原因，以及该轮**每个任务**的尝试次数、起止、耗时与结果。
+- **只增不改**：恢复再跑一轮只是追加一条新记录，前轮内容不被覆盖、不重复计数
+  （已完成任务在新轮记录中保持其原有尝试次数，不会膨胀）。
+- **查询稳定**：记录一旦追加即不可变，任务明细顺序与声明顺序一致；
+  反复查询同一份历史，结论一致、顺序稳定。
+- 被取消的执行轮同样留痕（`outcome=CANCELLED`）。
+
+---
+
+## 5. 提交语义：幂等、冲突与前置校验
+
+提交（`PUT /api/workflows`）按以下顺序判定，结论确定：
+
+1. **前置校验**：声明非法（结构问题 → `422`；`maxConcurrency`/`maxAttempts`/
+   `taskTimeoutMillis` 取值 < 1 → `400`）时在**登记之前**拒绝，
+   不留下任何记录——查询返回 `404`，修正取值后同 id 可正常重新提交，
+   不存在“提交失败但记录已存在”的半成品状态。
+2. **幂等重复**：同 id 且声明指纹一致（任务按名称规范化排序、依赖集合排序，
+   与书写顺序无关）→ 返回既有结论，`duplicateSubmission=true`，只执行一次。
+3. **显式冲突**：同 id 但声明指纹不一致（任务、行为、参数或执行参数任一不同）→
+   `409 DEFINITION_CONFLICT`，**不会**把对不上的旧结论当成新提交的结果返回，
+   既有记录不受任何影响。
+
+---
+
+## 6. 受控任务行为（确定性模拟）
 
 任务的 `behavior` 字段选择行为，`params` 为参数（均为字符串）：
 
@@ -99,7 +169,7 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
 
 ---
 
-## 4. 可配置项
+## 7. 可配置项
 
 `src/main/resources/application.properties` 中的全局默认值，可被单个工作流提交体中的
 同名字段覆盖（`maxConcurrency` / `maxAttempts` / `taskTimeoutMillis`）：
@@ -112,17 +182,18 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
 | `workflow.retry-backoff-millis` | 100 | 两次尝试之间的退避 |
 | `workflow.engine-threads` | 16 | 工作流调度线程池大小 |
 
-非法覆盖值（< 1）会被拒绝（HTTP `400`）。
+非法覆盖值（< 1）会在**登记之前**被拒绝（HTTP `400`），不留下任何执行记录。
 
 ---
 
-## 5. REST 接口
+## 8. REST 接口
 
 | 方法与路径 | 说明 |
 |---|---|
-| `PUT /api/workflows` | 提交并同步执行；重复/并发提交幂等返回同一份记录（`duplicateSubmission=true`） |
-| `GET /api/workflows/{id}` | 查询不可变状态快照；不存在返回 `404` |
-| `POST /api/workflows/{id}/resume` | 失败恢复；非 `FAILED` 状态幂等返回当前快照 |
+| `PUT /api/workflows` | 提交并同步执行；同 id 同声明幂等返回同一份记录（`duplicateSubmission=true`）；同 id 不同声明返回 `409` |
+| `GET /api/workflows/{id}` | 查询不可变状态快照（含 `history` 逐轮留痕）；不存在返回 `404` |
+| `POST /api/workflows/{id}/resume` | 失败恢复；非 `FAILED` 状态（含 `CANCELLED`）幂等返回当前快照 |
+| `POST /api/workflows/{id}/cancel` | 取消：执行中安全收敛、`FAILED` 直接转终态；幂等；不存在返回 `404` |
 
 提交体示例：
 
@@ -148,19 +219,35 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
  "message": "task 'A' depends on unknown task: GHOST"}
 ```
 
+冲突响应示例（同 id 不同声明，HTTP 409）：
+
+```json
+{"error": "DEFINITION_CONFLICT",
+ "message": "workflow 'demo-1' already exists with a different definition; ..."}
+```
+
+### 兼容范围
+
+- 快照 JSON 新增 `history` 字段（纯新增，旧字段不变）；`WorkflowState` 新增
+  `CANCELLED`、`TaskState` 新增 `CANCELLED` 枚举值——按状态做分支的调用方
+  应容忍未知枚举值。
+- 既有行为不变：提交/查询/恢复接口路径与语义、校验拒绝原因码、重试/超时/
+  并发约束均保持原样；唯一的语义收紧是**同 id 不同声明**从“按重复提交处理”
+  改为显式 `409`（此前会错误返回对不上的旧结论）。
+
 ---
 
-## 6. 本地验证方法
+## 9. 本地验证方法
 
 环境：JDK 21+、Maven 3.9+。
 
-### 6.1 运行全部测试（推荐，无需外部依赖）
+### 9.1 运行全部测试（推荐，无需外部依赖）
 
 ```bash
 mvn test
 ```
 
-共 19 个用例，覆盖：
+共 32 个用例，覆盖：
 
 | 测试类 | 覆盖场景 |
 |---|---|
@@ -170,7 +257,10 @@ mvn test
 | `WorkflowDependencyOrderTest` | 菱形依赖执行顺序满足依赖，互不依赖任务并发 |
 | `WorkflowRecoveryTest` | 失败后恢复成功（A 不重跑/不重复计数）；恢复仍失败时结论稳定 |
 | `WorkflowIdempotencyTest` | 顺序重复提交、8 线程并发提交只产生一次执行；非法提交可反复拒绝且不留记录 |
-| `WorkflowApiSmokeTest` | 真实 HTTP：422 拒绝、成功、查询、幂等、404、失败→恢复→成功全链路 |
+| `WorkflowCancelTest` | 执行中取消（在途收敛、未启动 CANCELLED、结果保留）；取消幂等且终态不可恢复；FAILED/SUCCEEDED 的取消语义；未登记 404 |
+| `WorkflowHistoryTest` | 失败+恢复追加两轮留痕且前轮不被覆盖；反复查询历史一致、顺序稳定；取消轮同样留痕 |
+| `WorkflowSubmissionSemanticsTest` | 同 id 同声明幂等；同 id 不同声明显式冲突且原记录不污染；非法取值登记前拦截、修正后可重新提交 |
+| `WorkflowApiSmokeTest` | 真实 HTTP：422/400/409/404、成功、查询、幂等、失败→恢复→成功、取消全链路、历史留痕 |
 
 日志中 `[测试断言]` / `[HTTP 测试]` 行会打印**触发原因与状态流转依据**，便于人工核对。
 例如重试耗尽时可见：
@@ -180,7 +270,7 @@ mvn test
 工作流状态流转 RUNNING -> FAILED，依据=任务 flaky 进入稳定失败（…），峰值并发=1
 ```
 
-### 6.2 启动服务并用 curl 验证
+### 9.2 启动服务并用 curl 验证
 
 ```bash
 mvn spring-boot:run
@@ -217,9 +307,33 @@ curl -s -X PUT localhost:8080/api/workflows -H 'Content-Type: application/json' 
     {"name":"B","dependsOn":[],"behavior":"FAIL_TOTAL_N","params":["2","0"]},
     {"name":"C","dependsOn":["B"],"behavior":"ALWAYS_SUCCEED","params":[]}]}'
 curl -s -X POST localhost:8080/api/workflows/demo-2/resume
+
+# 5) 历史留痕：demo-2 的 history 有两轮记录（FAILED 后追加 SUCCEEDED）
+curl -s localhost:8080/api/workflows/demo-2 | jq '.history[] | {runNumber, outcome}'
+
+# 6) 提交冲突：同 id 不同声明 -> 409 DEFINITION_CONFLICT
+curl -s -X PUT localhost:8080/api/workflows -H 'Content-Type: application/json' -d '{
+  "workflowId":"demo-1","tasks":[
+    {"name":"A","dependsOn":[],"behavior":"ALWAYS_FAIL","params":[]}]}'
+
+# 7) 非法取值 -> 400 且不留记录（查询 404，修正后可重新提交）
+curl -s -X PUT localhost:8080/api/workflows -H 'Content-Type: application/json' -d '{
+  "workflowId":"demo-3","maxConcurrency":0,"tasks":[
+    {"name":"A","dependsOn":[],"behavior":"ALWAYS_SUCCEED","params":[]}]}'
+curl -s localhost:8080/api/workflows/demo-3   # 404
+
+# 8) 取消：慢任务执行中发起取消 -> CANCELLED 终态；resume 不可拉起
+curl -s -X PUT localhost:8080/api/workflows -H 'Content-Type: application/json' -d '{
+  "workflowId":"demo-4","maxConcurrency":2,"maxAttempts":3,
+  "tasks":[
+    {"name":"A","dependsOn":[],"behavior":"ALWAYS_SUCCEED","params":["3000"]},
+    {"name":"B","dependsOn":["A"],"behavior":"ALWAYS_SUCCEED","params":[]}]}' &
+sleep 1
+curl -s -X POST localhost:8080/api/workflows/demo-4/cancel
+curl -s -X POST localhost:8080/api/workflows/demo-4/resume   # 仍 CANCELLED，终态稳定
 ```
 
-### 6.3 复现性说明
+### 9.3 复现性说明
 
 所有任务行为均为确定性逻辑（无随机数、无真实 IO），时间相关用例只断言
 有界区间与状态/计数，不对墙钟时间做精确断言，因此多次运行结论一致。

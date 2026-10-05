@@ -63,6 +63,11 @@ public class WorkflowEngine {
                 });
     }
 
+    /** 仅校验不登记：供服务层在幂等/冲突判定前拦截非法声明，不产生任何记录。 */
+    public void validate(WorkflowDefinition definition) {
+        validator.validate(definition);
+    }
+
     /** 登记新工作流：先校验，再占用 id；重复 id 抛 {@link IllegalArgumentException}。 */
     public WorkflowExecution register(WorkflowDefinition definition) {
         validator.validate(definition);
@@ -85,12 +90,96 @@ public class WorkflowEngine {
     }
 
     /**
+     * 请求取消（幂等）：
+     * <ul>
+     *   <li>RUNNING/REGISTERED：置取消标志，调度循环停止派发新任务、在途任务收敛后
+     *       落到 CANCELLED 终态；</li>
+     *   <li>FAILED：直接流转到 CANCELLED 终态，后续恢复请求不再生效；</li>
+     *   <li>SUCCEEDED：已成功完成，取消不改变结论（幂等空操作）；</li>
+     *   <li>CANCELLED：重复取消，幂等空操作。</li>
+     * </ul>
+     */
+    public void requestCancel(WorkflowExecution execution) {
+        String workflowId = execution.getDefinition().getWorkflowId();
+        WorkflowState state = execution.getState();
+        switch (state) {
+            case CANCELLED -> log.info("[{}] 取消请求被幂等忽略：已处于 CANCELLED 终态", workflowId);
+            case SUCCEEDED -> log.info(
+                    "[{}] 取消请求被幂等忽略：工作流已 SUCCEEDED，结论不可撤销", workflowId);
+            case FAILED -> {
+                execution.requestCancel();
+                execution.setFinishedAt(System.currentTimeMillis());
+                execution.setState(WorkflowState.CANCELLED);
+                execution.setFailureTask("(cancel)");
+                execution.setFailureReason("cancel requested by client");
+                log.warn("[{}] 工作流状态流转 FAILED -> CANCELLED，依据=收到取消请求，"
+                        + "取消为稳定终态，后续恢复请求不再生效", workflowId);
+            }
+            default -> {
+                execution.requestCancel();
+                log.warn("[{}] 接受取消请求：状态={}，调度器将停止派发新任务并等待在途任务收敛",
+                        workflowId, state);
+            }
+        }
+    }
+
+    /**
+     * 取消并等待收敛：上界由既有约束推导
+     * （单任务总耗时 ≤ maxAttempts × (超时 + 退避)，另加余量），不会无限等待。
+     */
+    public void cancelAndAwait(WorkflowExecution execution) {
+        requestCancel(execution);
+        WorkflowState s = execution.getState();
+        if (s == WorkflowState.SUCCEEDED || s == WorkflowState.FAILED
+                || s == WorkflowState.CANCELLED) {
+            return;
+        }
+        var d = execution.getDefinition();
+        long bound = (long) resolveMaxAttempts(d)
+                * (resolveTimeoutMillis(d) + properties.getRetryBackoffMillis())
+                + 10_000L;
+        awaitTerminal(execution, bound);
+    }
+
+    /**
+     * 有界等待工作流到达终态（SUCCEEDED/FAILED/CANCELLED）。
+     * 由取消路径调用；上界由既有约束保证（单任务耗时与尝试次数均有界），
+     * 这里的超时只是防御性兜底，返回是否已在终态。
+     */
+    public boolean awaitTerminal(WorkflowExecution execution, long timeoutMillis) {
+        String workflowId = execution.getDefinition().getWorkflowId();
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            WorkflowState s = execution.getState();
+            if (s == WorkflowState.SUCCEEDED || s == WorkflowState.FAILED
+                    || s == WorkflowState.CANCELLED) {
+                return true;
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        log.warn("[{}] 等待终态超过 {}ms（防御性兜底，正常不会到达），当前状态={}",
+                workflowId, timeoutMillis, execution.getState());
+        return false;
+    }
+
+    /**
      * 同步执行（首次执行或失败恢复）一个已登记工作流。
      * 调用方需保证同一执行记录不会被并发调用（服务层按 id 加锁）。
+     * 已处于 CANCELLED 终态的执行记录拒绝再执行（取消不可逆）。
      */
     public void execute(WorkflowExecution execution) {
         String workflowId = execution.getDefinition().getWorkflowId();
+        if (execution.getState() == WorkflowState.CANCELLED) {
+            log.warn("[{}] 执行请求被拒绝：工作流已处于 CANCELLED 终态，取消不可逆", workflowId);
+            return;
+        }
         int run = execution.incrementRunCount();
+        long runStartedAt = System.currentTimeMillis();
         int maxConcurrency = resolveMaxConcurrency(execution.getDefinition());
         int maxAttempts = resolveMaxAttempts(execution.getDefinition());
         long timeoutMillis = resolveTimeoutMillis(execution.getDefinition());
@@ -124,7 +213,7 @@ public class WorkflowEngine {
         execution.setFailureTask(null);
         execution.setFailureReason("");
 
-        runLoop(execution, tasks, maxConcurrency, maxAttempts, timeoutMillis);
+        runLoop(execution, tasks, maxConcurrency, maxAttempts, timeoutMillis, run, runStartedAt);
     }
 
     /**
@@ -177,7 +266,8 @@ public class WorkflowEngine {
     }
 
     private void runLoop(WorkflowExecution execution, Map<String, TaskRuntime> tasks,
-                         int maxConcurrency, int maxAttempts, long timeoutMillis) {
+                         int maxConcurrency, int maxAttempts, long timeoutMillis,
+                         int run, long runStartedAt) {
         String workflowId = execution.getDefinition().getWorkflowId();
         Semaphore permits = new Semaphore(maxConcurrency);
         AtomicInteger running = new AtomicInteger(0);
@@ -192,8 +282,20 @@ public class WorkflowEngine {
         while (!done) {
             synchronized (scheduleLock) {
                 while (!done) {
-                    // 1) 失败已注定：所有尚未派发的任务直接 SKIPPED
                     boolean madeProgress = false;
+                    // 1a) 取消已请求：所有尚未派发的任务直接 CANCELLED，不再启动新任务
+                    if (execution.isCancelRequested()) {
+                        for (TaskRuntime t : tasks.values()) {
+                            if (t.getState() == TaskState.PENDING) {
+                                t.setState(TaskState.CANCELLED);
+                                t.setLastMessage("cancelled: workflow cancel requested");
+                                log.info("[{}] 任务 {} 状态流转 PENDING -> CANCELLED，依据=收到取消请求，未启动任务不再派发",
+                                        workflowId, t.getDefinition().getName());
+                                madeProgress = true;
+                            }
+                        }
+                    }
+                    // 1b) 失败已注定：所有尚未派发的任务直接 SKIPPED
                     if (firstFailure[0] != null) {
                         for (TaskRuntime t : tasks.values()) {
                             if (t.getState() == TaskState.PENDING) {
@@ -209,10 +311,11 @@ public class WorkflowEngine {
                         }
                     }
 
-                    // 2) 派发所有“依赖已满足且当前有并发许可”的任务
+                    // 2) 派发所有“依赖已满足且当前有并发许可”的任务（取消/失败后不再派发）
                     for (TaskRuntime t : tasks.values()) {
                         if (t.getState() == TaskState.PENDING
                                 && firstFailure[0] == null
+                                && !execution.isCancelRequested()
                                 && depsSatisfied(t, tasks)
                                 && permits.tryAcquire()) {
                             // 许可已到手，任务才允许离开 PENDING，杜绝假死
@@ -248,10 +351,24 @@ public class WorkflowEngine {
             }
         }
 
-        // 终态判定：依据首个失败任务，结论确定
+        // 终态判定：取消优先于失败/成功，结论确定
         execution.setPeakConcurrency(peak.get());
         execution.setFinishedAt(System.currentTimeMillis());
-        if (firstFailure[0] != null || interrupted) {
+        if (execution.isCancelRequested()) {
+            // 在途任务已收敛（running==0），防御性兜底：仍非终态的一律 CANCELLED
+            for (TaskRuntime t : tasks.values()) {
+                if (t.getState() == TaskState.PENDING || t.getState() == TaskState.RUNNING) {
+                    t.setState(TaskState.CANCELLED);
+                    t.setLastMessage("cancelled: workflow aborted");
+                }
+            }
+            execution.setFailureTask("(cancel)");
+            execution.setFailureReason("cancel requested by client");
+            execution.setState(WorkflowState.CANCELLED);
+            log.warn("[{}] 工作流状态流转 RUNNING -> CANCELLED，依据=收到取消请求，"
+                            + "在途任务已收敛、未启动任务不再执行、已完成结果保留，峰值并发={}",
+                    workflowId, peak.get());
+        } else if (firstFailure[0] != null || interrupted) {
             for (TaskRuntime t : tasks.values()) {
                 if (t.getState() == TaskState.PENDING || t.getState() == TaskState.RUNNING) {
                     t.setState(TaskState.SKIPPED);
@@ -276,6 +393,33 @@ public class WorkflowEngine {
             log.info("[{}] 工作流状态流转 RUNNING -> SUCCEEDED，全部任务成功，峰值并发={}，总耗时={}ms",
                     workflowId, peak.get(), duration);
         }
+
+        appendRunRecord(execution, tasks, run, runStartedAt);
+    }
+
+    /**
+     * 每轮收敛后追加一条不可变留痕：轮次、起止、结论与各任务该轮的
+     * 尝试次数/耗时/结果。只增不改，恢复执行只是追加新一轮。
+     */
+    private void appendRunRecord(WorkflowExecution execution, Map<String, TaskRuntime> tasks,
+                                 int run, long runStartedAt) {
+        String workflowId = execution.getDefinition().getWorkflowId();
+        List<com.github.highcumontoa.workfloworchestrationjava.model.TaskRunRecord> taskRecords =
+                new ArrayList<>();
+        for (TaskRuntime t : tasks.values()) {
+            long duration = t.getFinishMillis() == 0 || t.getStartMillis() == 0
+                    ? 0 : t.getFinishMillis() - t.getStartMillis();
+            taskRecords.add(new com.github.highcumontoa.workfloworchestrationjava.model.TaskRunRecord(
+                    t.getDefinition().getName(), t.getState(), t.getAttempts(),
+                    t.getStartMillis(), t.getFinishMillis(), duration, t.getLastMessage()));
+        }
+        execution.appendHistory(new com.github.highcumontoa.workfloworchestrationjava.model.RunRecord(
+                run, runStartedAt, execution.getFinishedAt(), execution.getState(),
+                execution.getFailureTask(), execution.getFailureReason(),
+                List.copyOf(taskRecords)));
+        log.info("[{}] 第{}轮执行留痕已追加：结论={}，起={}，止={}，任务明细数={}（历史只增不改）",
+                workflowId, run, execution.getState(), runStartedAt,
+                execution.getFinishedAt(), taskRecords.size());
     }
 
     /** 许可已由调度线程持有；本方法把任务派发到工作线程，并在结束时释放许可。 */
@@ -296,7 +440,8 @@ public class WorkflowEngine {
                         workflowId, task.getDefinition().getName(),
                         permitsTrack(permits, maxConcurrency));
 
-                boolean ok = taskExecutor.runTask(task, workflowId, maxAttempts, timeoutMillis);
+                boolean ok = taskExecutor.runTask(task, workflowId, maxAttempts, timeoutMillis,
+                        execution::isCancelRequested);
                 if (!ok) {
                     synchronized (scheduleLock) {
                         if (firstFailure[0] == null) {
@@ -404,6 +549,7 @@ public class WorkflowEngine {
                 execution.getRunCount(), resolveMaxConcurrency(d), execution.getPeakConcurrency(),
                 resolveMaxAttempts(d), resolveTimeoutMillis(d),
                 execution.getFailureTask(), execution.getFailureReason(),
-                execution.getStartedAt(), execution.getFinishedAt(), list, duplicate);
+                execution.getStartedAt(), execution.getFinishedAt(), list, duplicate,
+                execution.history());
     }
 }

@@ -1,5 +1,6 @@
 package com.github.highcumontoa.workfloworchestrationjava.web;
 
+import com.github.highcumontoa.workfloworchestrationjava.service.WorkflowConflictException;
 import com.github.highcumontoa.workfloworchestrationjava.service.WorkflowNotFoundException;
 import com.github.highcumontoa.workfloworchestrationjava.validation.ValidationException;
 import org.slf4j.Logger;
@@ -31,6 +32,15 @@ public class ApiExceptionHandler {
     public ResponseEntity<Map<String, Object>> handleNotFound(WorkflowNotFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
                 "error", "WORKFLOW_NOT_FOUND",
+                "message", ex.getMessage()
+        ));
+    }
+
+    @ExceptionHandler(WorkflowConflictException.class)
+    public ResponseEntity<Map<String, Object>> handleConflict(WorkflowConflictException ex) {
+        log.warn("HTTP 409 提交冲突：{}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                "error", "DEFINITION_CONFLICT",
                 "message", ex.getMessage()
         ));
     }

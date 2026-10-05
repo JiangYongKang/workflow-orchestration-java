@@ -5,5 +5,7 @@ public enum WorkflowState {
     REGISTERED,
     RUNNING,
     SUCCEEDED,
-    FAILED
+    FAILED,
+    /** 取消后的稳定终态：不可恢复、不可再执行。 */
+    CANCELLED
 }

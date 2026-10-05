@@ -141,5 +141,100 @@ class WorkflowApiSmokeTest {
         assertEquals("SUCCEEDED", a.get("state").asText());
         assertEquals(2, a.get("runCount").asInt());
         log.info("[HTTP 测试] 成功后再次 resume 幂等，runCount 仍=2");
+
+        // 历史：两轮留痕，结论分别 FAILED / SUCCEEDED
+        JsonNode history = a.get("history");
+        assertEquals(2, history.size());
+        assertEquals("FAILED", history.get(0).get("outcome").asText());
+        assertEquals("SUCCEEDED", history.get(1).get("outcome").asText());
+        assertEquals(3, history.get(0).get("tasks").size());
+        log.info("[HTTP 测试] 历史留痕：run1={} run2={}，任务明细数={}",
+                history.get(0).get("outcome").asText(),
+                history.get(1).get("outcome").asText(),
+                history.get(0).get("tasks").size());
+    }
+
+    @Test
+    @DisplayName("HTTP 提交冲突：同 id 不同声明 -> 409/DEFINITION_CONFLICT；非法取值 -> 400 且不留记录")
+    void submissionConflictOverHttp() throws Exception {
+        Map<String, Object> wf = workflow("http-conflict",
+                List.of(task("A", "ALWAYS_SUCCEED", null, null)), 2, 2, 5000L);
+        ResponseEntity<String> created = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(wf), String.class);
+        assertEquals(HttpStatus.OK, created.getStatusCode());
+
+        // 同 id 不同声明 -> 409
+        Map<String, Object> divergent = workflow("http-conflict",
+                List.of(task("A", "ALWAYS_FAIL", null, null)), 2, 2, 5000L);
+        ResponseEntity<String> conflict = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(divergent), String.class);
+        JsonNode c = json.readTree(conflict.getBody());
+        log.info("[HTTP 测试] 冲突提交 status={} body={}", conflict.getStatusCode(),
+                conflict.getBody());
+        assertEquals(HttpStatus.CONFLICT, conflict.getStatusCode());
+        assertEquals("DEFINITION_CONFLICT", c.get("error").asText());
+
+        // 非法取值 -> 400，且不留记录（查询 404）
+        Map<String, Object> invalid = workflow("http-invalid",
+                List.of(task("A", "ALWAYS_SUCCEED", null, null)), 0, 2, 5000L);
+        ResponseEntity<String> bad = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(invalid), String.class);
+        log.info("[HTTP 测试] 非法取值提交 status={} body={}", bad.getStatusCode(), bad.getBody());
+        assertEquals(HttpStatus.BAD_REQUEST, bad.getStatusCode());
+        ResponseEntity<String> nf = rest.getForEntity("/api/workflows/http-invalid", String.class);
+        assertEquals(HttpStatus.NOT_FOUND, nf.getStatusCode(), "非法提交不得留下半成品记录");
+
+        // 修正后同 id 可正常提交
+        Map<String, Object> fixed = workflow("http-invalid",
+                List.of(task("A", "ALWAYS_SUCCEED", null, null)), 2, 2, 5000L);
+        ResponseEntity<String> ok = rest.exchange("/api/workflows",
+                HttpMethod.PUT, new HttpEntity<>(fixed), String.class);
+        assertEquals(HttpStatus.OK, ok.getStatusCode());
+        assertEquals("SUCCEEDED", json.readTree(ok.getBody()).get("state").asText());
+        log.info("[HTTP 测试] 修正取值后重新提交成功");
+    }
+
+    @Test
+    @DisplayName("HTTP 取消：执行中取消 -> CANCELLED 终态；重复取消幂等；resume 不可拉起；未登记 404")
+    void cancelOverHttp() throws Exception {
+        Map<String, Object> wf = workflow("http-cancel",
+                List.of(
+                        task("A", "ALWAYS_SUCCEED", List.of("300"), null),
+                        task("B", "ALWAYS_SUCCEED", null, List.of("A"))
+                ), 2, 2, 5000L);
+        java.util.concurrent.CompletableFuture<ResponseEntity<String>> submitted =
+                java.util.concurrent.CompletableFuture.supplyAsync(() -> rest.exchange(
+                        "/api/workflows", HttpMethod.PUT, new HttpEntity<>(wf), String.class));
+        Thread.sleep(100);
+
+        ResponseEntity<String> cancelled = rest.exchange("/api/workflows/http-cancel/cancel",
+                HttpMethod.POST, HttpEntity.EMPTY, String.class);
+        JsonNode c = json.readTree(cancelled.getBody());
+        log.info("[HTTP 测试] 取消 status={} state={} runCount={}",
+                cancelled.getStatusCode(), c.get("state").asText(), c.get("runCount").asInt());
+        assertEquals(HttpStatus.OK, cancelled.getStatusCode());
+        assertEquals("CANCELLED", c.get("state").asText());
+        assertEquals("CANCELLED",
+                json.readTree(submitted.join().getBody()).get("state").asText());
+
+        // 重复取消幂等
+        ResponseEntity<String> again = rest.exchange("/api/workflows/http-cancel/cancel",
+                HttpMethod.POST, HttpEntity.EMPTY, String.class);
+        JsonNode a = json.readTree(again.getBody());
+        assertEquals("CANCELLED", a.get("state").asText());
+        assertEquals(c.get("runCount").asInt(), a.get("runCount").asInt());
+
+        // 取消后恢复不得拉起
+        ResponseEntity<String> resumed = rest.exchange("/api/workflows/http-cancel/resume",
+                HttpMethod.POST, HttpEntity.EMPTY, String.class);
+        JsonNode r = json.readTree(resumed.getBody());
+        assertEquals("CANCELLED", r.get("state").asText());
+        assertEquals(c.get("runCount").asInt(), r.get("runCount").asInt());
+        log.info("[HTTP 测试] 取消后 resume 不生效，终态稳定");
+
+        // 未登记 -> 404
+        ResponseEntity<String> nf = rest.exchange("/api/workflows/ghost/cancel",
+                HttpMethod.POST, HttpEntity.EMPTY, String.class);
+        assertEquals(HttpStatus.NOT_FOUND, nf.getStatusCode());
     }
 }

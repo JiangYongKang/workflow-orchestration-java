@@ -30,4 +30,9 @@ public class WorkflowController {
     public WorkflowSnapshot resume(@PathVariable String workflowId) {
         return workflowService.resume(workflowId);
     }
+
+    @PostMapping("/{workflowId}/cancel")
+    public WorkflowSnapshot cancel(@PathVariable String workflowId) {
+        return workflowService.cancel(workflowId);
+    }
 }
