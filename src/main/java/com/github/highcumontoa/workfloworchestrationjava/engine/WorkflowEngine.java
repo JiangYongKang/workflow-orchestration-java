@@ -209,11 +209,21 @@ public class WorkflowEngine {
             log.info("[{}] 工作流失败恢复开始（runCount={}）：已完成任务保持不变，剩余任务继续执行",
                     workflowId, run);
         }
+
+        // 本轮尝试计数基线：在恢复重置之后、派发之前采样。
+        // 跨轮保留的 SUCCEEDED 任务基线即其历史总次数，本轮增量恒为 0；
+        // 被重置重跑的任务基线为 0，本轮增量即本轮真实尝试次数。
+        Map<String, Integer> attemptBaseline = new LinkedHashMap<>();
+        for (TaskRuntime t : tasks.values()) {
+            attemptBaseline.put(t.getDefinition().getName(), t.getAttempts());
+        }
+
         execution.setState(WorkflowState.RUNNING);
         execution.setFailureTask(null);
         execution.setFailureReason("");
 
-        runLoop(execution, tasks, maxConcurrency, maxAttempts, timeoutMillis, run, runStartedAt);
+        runLoop(execution, tasks, maxConcurrency, maxAttempts, timeoutMillis, run, runStartedAt,
+                attemptBaseline);
     }
 
     /**
@@ -267,7 +277,7 @@ public class WorkflowEngine {
 
     private void runLoop(WorkflowExecution execution, Map<String, TaskRuntime> tasks,
                          int maxConcurrency, int maxAttempts, long timeoutMillis,
-                         int run, long runStartedAt) {
+                         int run, long runStartedAt, Map<String, Integer> attemptBaseline) {
         String workflowId = execution.getDefinition().getWorkflowId();
         Semaphore permits = new Semaphore(maxConcurrency);
         AtomicInteger running = new AtomicInteger(0);
@@ -394,24 +404,37 @@ public class WorkflowEngine {
                     workflowId, peak.get(), duration);
         }
 
-        appendRunRecord(execution, tasks, run, runStartedAt);
+        appendRunRecord(execution, tasks, run, runStartedAt, attemptBaseline);
     }
 
     /**
      * 每轮收敛后追加一条不可变留痕：轮次、起止、结论与各任务该轮的
      * 尝试次数/耗时/结果。只增不改，恢复执行只是追加新一轮。
+     *
+     * <p>留痕严格归属本轮：尝试次数取“当前累计 − 本轮基线”的增量；
+     * 本轮增量为 0 的任务（跨轮保留的已完成任务、被跳过/取消且未执行的任务）
+     * 记 0 次尝试、起止时间与耗时一律为 0，绝不沿用上一轮的时间戳。
      */
     private void appendRunRecord(WorkflowExecution execution, Map<String, TaskRuntime> tasks,
-                                 int run, long runStartedAt) {
+                                 int run, long runStartedAt,
+                                 Map<String, Integer> attemptBaseline) {
         String workflowId = execution.getDefinition().getWorkflowId();
         List<com.github.highcumontoa.workfloworchestrationjava.model.TaskRunRecord> taskRecords =
                 new ArrayList<>();
         for (TaskRuntime t : tasks.values()) {
-            long duration = t.getFinishMillis() == 0 || t.getStartMillis() == 0
-                    ? 0 : t.getFinishMillis() - t.getStartMillis();
+            String name = t.getDefinition().getName();
+            int runAttempts = t.getAttempts() - attemptBaseline.getOrDefault(name, 0);
+            long started = runAttempts > 0 ? t.getStartMillis() : 0;
+            long finished = runAttempts > 0 ? t.getFinishMillis() : 0;
+            long duration = started == 0 || finished == 0 ? 0 : finished - started;
             taskRecords.add(new com.github.highcumontoa.workfloworchestrationjava.model.TaskRunRecord(
-                    t.getDefinition().getName(), t.getState(), t.getAttempts(),
-                    t.getStartMillis(), t.getFinishMillis(), duration, t.getLastMessage()));
+                    name, t.getState(), runAttempts, started, finished, duration,
+                    t.getLastMessage()));
+            log.info("[{}] 第{}轮留痕：任务 {} 本轮尝试={}次（基线={}，累计={}），状态={}，"
+                            + "本轮起={}，止={}，耗时={}ms",
+                    workflowId, run, name, runAttempts,
+                    attemptBaseline.getOrDefault(name, 0), t.getAttempts(),
+                    t.getState(), started, finished, duration);
         }
         execution.appendHistory(new com.github.highcumontoa.workfloworchestrationjava.model.RunRecord(
                 run, runStartedAt, execution.getFinishedAt(), execution.getState(),
