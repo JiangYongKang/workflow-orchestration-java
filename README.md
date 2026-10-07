@@ -53,6 +53,8 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
 - **恢复时**：`SUCCEEDED` 任务原样保留（含尝试计数与耗时，绝不重跑）；
   `FAILED` 任务回到 `PENDING` 且尝试计数清零；被其连累的 `SKIPPED` 任务按依赖闭包
   重新解锁为 `PENDING`，随后正常调度。
+  注意：这里说的是**当前状态快照**中的累计计数；逐轮历史留痕（见第 4 节）中，
+  保留未重跑的任务在新一轮记录里记 0 次尝试、起止与耗时均为 0。
 
 ### 1.3 登记校验拒绝原因 `RejectReason`
 
@@ -122,7 +124,10 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
   "failureTask": null,
   "failureReason": "",
   "tasks": [
-    {"name": "A", "finalState": "SUCCEEDED", "attempts": 1,
+    {"name": "A", "finalState": "SUCCEEDED", "attempts": 0,
+     "startedAtEpochMillis": 0, "finishedAtEpochMillis": 0,
+     "durationMillis": 0, "message": "succeeded on attempt 1"},
+    {"name": "B", "finalState": "SUCCEEDED", "attempts": 1,
      "startedAtEpochMillis": 1791158974389, "finishedAtEpochMillis": 1791158974390,
      "durationMillis": 1, "message": "succeeded on attempt 1"}
   ]
@@ -131,11 +136,47 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
 
 - 每轮记录：轮次号、起止时间、最终结论（`SUCCEEDED`/`FAILED`/`CANCELLED`）、
   失败任务与原因，以及该轮**每个任务**的尝试次数、起止、耗时与结果。
-- **只增不改**：恢复再跑一轮只是追加一条新记录，前轮内容不被覆盖、不重复计数
-  （已完成任务在新轮记录中保持其原有尝试次数，不会膨胀）。
+- **逐轮归属**：每个任务的 `attempts` 与起止时间**只反映这一轮真实发生的执行**。
+  本轮没有重新跑过的任务——包括恢复轮中跨轮保留下来的 `SUCCEEDED` 任务、
+  以及本轮被 `SKIPPED`/`CANCELLED` 而压根没执行的任务——在本轮记录中
+  `attempts=0`、`startedAtEpochMillis=0`、`finishedAtEpochMillis=0`、
+  `durationMillis=0`，不沿用上一轮的旧起止时间，也不把旧时间算成本轮耗时；
+  其 `finalState` 仍如实呈现该任务在本轮结束时的状态（如上面示例中的任务 A：
+  第 2 轮它并未重跑，记 0 次尝试，但状态仍是第 1 轮跑出来的 `SUCCEEDED`）。
+  本轮真实执行过的任务，其起止时间必然落在本轮的
+  `[startedAtEpochMillis, finishedAtEpochMillis]` 窗口内。
+- **累加一致**：把同一任务在所有轮里的 `attempts` 相加，恰好等于它真实执行过的
+  总次数——不会多算（保留任务不重复计数），也不会少算（每轮增量如实记录）。
+  三轮及以上连续恢复时该等式同样成立。
+- **只增不改**：恢复再跑一轮只是追加一条新记录，前轮内容不被覆盖、不被改写；
+  已处于 `SUCCEEDED`/`CANCELLED` 终态的工作流不会再追加新轮次，
+  恢复请求被幂等忽略。
 - **查询稳定**：记录一旦追加即不可变，任务明细顺序与声明顺序一致；
   反复查询同一份历史，结论一致、顺序稳定。
 - 被取消的执行轮同样留痕（`outcome=CANCELLED`）。
+
+### 本地验证
+
+```bash
+# 运行历史留痕相关单测，日志会打印每轮每任务的状态流转与尝试次数依据
+mvn test -Dtest=WorkflowHistoryTest
+```
+
+关键用例：
+
+- `resumeAppendsRunRecordWithoutOverwriting`：首轮失败 → 恢复成功，
+  断言第 2 轮中未重跑的任务 `attempts=0`、起止与耗时均为 0，
+  且跨轮尝试累加等于真实总次数；
+- `multiRoundRecoveryAccumulatesConsistently`：三轮连续恢复（FAILED→FAILED→
+  SUCCEEDED），断言每轮结论/起止限定在各自轮次窗口内、前轮记录不被改写、
+  逐轮尝试次数累加与真实总次数完全相等、被跳过任务不算执行过。
+
+引擎在每轮收尾时也会打印逐任务留痕日志，可直接观察归属判定，例如：
+
+```
+[wf-1] 第2轮留痕：任务 A 本轮未重新执行（状态=SUCCEEDED），本轮尝试记 0 次、起止时间与耗时记 0，不沿用上一轮旧值
+[wf-1] 第2轮留痕：任务 B 本轮真实执行，尝试=1次（累计3次），状态=SUCCEEDED，本轮耗时=2ms
+```
 
 ---
 
@@ -247,7 +288,7 @@ PENDING ──依赖满足且拿到并发许可──▶ RUNNING ──尝试成
 mvn test
 ```
 
-共 32 个用例，覆盖：
+共 33 个用例，覆盖：
 
 | 测试类 | 覆盖场景 |
 |---|---|
@@ -258,7 +299,7 @@ mvn test
 | `WorkflowRecoveryTest` | 失败后恢复成功（A 不重跑/不重复计数）；恢复仍失败时结论稳定 |
 | `WorkflowIdempotencyTest` | 顺序重复提交、8 线程并发提交只产生一次执行；非法提交可反复拒绝且不留记录 |
 | `WorkflowCancelTest` | 执行中取消（在途收敛、未启动 CANCELLED、结果保留）；取消幂等且终态不可恢复；FAILED/SUCCEEDED 的取消语义；未登记 404 |
-| `WorkflowHistoryTest` | 失败+恢复追加两轮留痕且前轮不被覆盖；反复查询历史一致、顺序稳定；取消轮同样留痕 |
+| `WorkflowHistoryTest` | 失败+恢复追加两轮留痕且前轮不被覆盖、未重跑任务记 0 次尝试；三轮连续恢复的逐轮窗口与跨轮累加一致性；反复查询历史一致、顺序稳定；取消轮同样留痕 |
 | `WorkflowSubmissionSemanticsTest` | 同 id 同声明幂等；同 id 不同声明显式冲突且原记录不污染；非法取值登记前拦截、修正后可重新提交 |
 | `WorkflowApiSmokeTest` | 真实 HTTP：422/400/409/404、成功、查询、幂等、失败→恢复→成功、取消全链路、历史留痕 |
 
